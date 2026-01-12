@@ -2,8 +2,9 @@ import os
 import re
 from logging import getLogger
 from pathlib import Path
-from typing import Any, Callable, Generator, Literal
+from typing import IO, Any, Callable, Generator, Literal, cast
 
+import yaml
 from pydantic import (
     BaseModel,
     Field,
@@ -23,7 +24,11 @@ from inspect_ai.log._condense import resolve_sample_attachments
 from inspect_ai.log._log import EvalSampleSummary
 
 from ._log import EvalLog, EvalMetric, EvalSample
-from ._recorders import recorder_type_for_format, recorder_type_for_location
+from ._recorders import (
+    recorder_type_for_bytes,
+    recorder_type_for_format,
+    recorder_type_for_location,
+)
 
 logger = getLogger(__name__)
 
@@ -241,7 +246,7 @@ def write_log_dir_manifest(
 
 
 def read_eval_log(
-    log_file: str | Path | EvalLogInfo,
+    log_file: str | Path | EvalLogInfo | IO[bytes],
     header_only: bool = False,
     resolve_attachments: bool | Literal["full", "core"] = False,
     format: Literal["eval", "json", "auto"] = "auto",
@@ -249,13 +254,15 @@ def read_eval_log(
     """Read an evaluation log.
 
     Args:
-       log_file (str | FileInfo): Log file to read.
+       log_file (str | Path | EvalLogInfo | IO[bytes]): Log file to read.
+          When providing IO[bytes], the returned EvalLog will have an
+          empty location (which can be set manually if needed).
        header_only (bool): Read only the header (i.e. exclude
           the "samples" and "logging" fields). Defaults to False.
        resolve_attachments (bool): Resolve attachments (duplicated content blocks)
           to their full content.
        format (Literal["eval", "json", "auto"]): Read from format
-          (defaults to 'auto' based on `log_file` extension)
+          (defaults to 'auto' based on `log_file` extension).
 
     Returns:
        EvalLog object read from file.
@@ -279,7 +286,7 @@ def read_eval_log(
 
 
 async def read_eval_log_async(
-    log_file: str | Path | EvalLogInfo,
+    log_file: str | Path | EvalLogInfo | IO[bytes],
     header_only: bool = False,
     resolve_attachments: bool | Literal["full", "core"] = False,
     format: Literal["eval", "json", "auto"] = "auto",
@@ -287,33 +294,46 @@ async def read_eval_log_async(
     """Read an evaluation log.
 
     Args:
-       log_file (str | FileInfo): Log file to read.
+       log_file (str | Path | EvalLogInfo | IO[bytes]): Log file to read.
+          When providing IO[bytes], the returned EvalLog will have an
+          empty location (which can be set manually if needed).
        header_only (bool): Read only the header (i.e. exclude
           the "samples" and "logging" fields). Defaults to False.
        resolve_attachments (bool): Resolve attachments (duplicated content blocks)
           to their full content.
        format (Literal["eval", "json", "auto"]): Read from format
-          (defaults to 'auto' based on `log_file` extension)
+          (defaults to 'auto' based on `log_file` extension).
 
     Returns:
        EvalLog object read from file.
     """
-    # resolve to file path
-    log_file = (
-        log_file
-        if isinstance(log_file, str)
-        else log_file.as_posix()
-        if isinstance(log_file, Path)
-        else log_file.name
-    )
-    logger.debug(f"Reading eval log from {log_file}")
+    is_bytes = not isinstance(log_file, (str, Path, EvalLogInfo))
+    if is_bytes:
+        log_bytes = cast("IO[bytes]", log_file)
+        if format == "auto":
+            recorder_type = recorder_type_for_bytes(log_bytes)
+        else:
+            recorder_type = recorder_type_for_format(format)
 
-    # get recorder type
-    if format == "auto":
-        recorder_type = recorder_type_for_location(log_file)
+        logger.debug("Reading eval log from stream")
+        log = await recorder_type.read_log_bytes(log_bytes, header_only)
     else:
-        recorder_type = recorder_type_for_format(format)
-    log = await recorder_type.read_log(log_file, header_only)
+        # resolve to file path
+        log_file = (
+            log_file
+            if isinstance(log_file, str)
+            else log_file.as_posix()
+            if isinstance(log_file, Path)
+            else log_file.name
+        )
+        logger.debug(f"Reading eval log from {log_file}")
+
+        # get recorder type
+        if format == "auto":
+            recorder_type = recorder_type_for_location(log_file)
+        else:
+            recorder_type = recorder_type_for_format(format)
+        log = await recorder_type.read_log(log_file, header_only)
 
     # resolve attachement if requested
     if resolve_attachments and log.samples:
@@ -330,7 +350,8 @@ async def read_eval_log_async(
                 sample_ids[sample.id] = None
         log.eval.dataset.sample_ids = list(sample_ids.keys())
 
-    logger.debug(f"Completed reading eval log from {log_file}")
+    location = "stream" if is_bytes else log_file
+    logger.debug(f"Completed reading eval log from {location}")
 
     return log
 
@@ -723,3 +744,78 @@ def to_overview(header: EvalLog) -> LogOverview:
         completed_at=header.stats.completed_at,
         primary_metric=primary_metric,
     )
+
+
+def push_eval_result_to_model_repo(eval_log: EvalLog, log_location: str) -> None:
+    """Pushed an eval result file to a hugging face model repo.
+
+    more details: https://huggingface.co/docs/hub/eval-results
+
+    Args:
+        eval_log: The evaluation log
+        log_location: Path to the log file
+    """
+    import io
+
+    from huggingface_hub import CommitOperationAdd, HfApi
+
+    if (
+        hub_benchmark_metadata := eval_log.eval.metadata.get("hub_benchmark", None)
+    ) is None:
+        logger.warning("No hub benchmark metadata found, skipping result file")
+        return
+
+    # Get accuracy value from default scorer or first scorer
+    if default_scorer_key := hub_benchmark_metadata.get("default_scorer"):
+        default_scorer = eval_log.results.scores[default_scorer_key]
+        accuracy_value = default_scorer.metrics["accuracy"].value
+    else:
+        if len(eval_log.results.scores) > 1:
+            logger.warning(
+                "Multiple scorers found, but no default scorer specified, using the first scorer"
+            )
+        accuracy_value = eval_log.results.scores[0].metrics["accuracy"].value
+
+    # Build result dictionary
+    result: dict[str, Any] = {
+        "dataset": {"id": eval_log.eval.dataset.location},
+        "value": accuracy_value,
+        "date": eval_log.eval.created,
+    }
+
+    if task_id := hub_benchmark_metadata.get("id"):
+        result["dataset"]["task_id"] = task_id
+
+    if dataset_revision := hub_benchmark_metadata.get("dataset_revision"):
+        result["dataset"]["revision"] = dataset_revision
+
+    log_fs = filesystem(log_location)
+    log_dir = os.path.dirname(log_location) or "."
+    task_name = eval_log.eval.task.replace("/", "-")
+    filename = (
+        f"{eval_log.eval.created}-{task_name}_{eval_log.eval.task_id}-result.yaml"
+    )
+    yaml_path = f"{log_dir}{log_fs.sep}{filename}"
+    yaml_content = yaml.dump([result], default_flow_style=False, sort_keys=False)
+
+    model_name = eval_log.eval.model
+    model_repo = model_name.split("/", 1)[-1]
+    yaml_filename = os.path.basename(yaml_path)
+    result_file_path = f"result_files/{yaml_filename}"
+
+    api = HfApi()
+    try:
+        api.create_commit(
+            repo_id=model_repo,
+            repo_type="model",
+            commit_message=f"Add evaluation results for {eval_log.eval.task}",
+            operations=[
+                CommitOperationAdd(
+                    path_in_repo=result_file_path,
+                    path_or_fileobj=io.BytesIO(yaml_content.encode("utf-8")),
+                )
+            ],
+            create_pr=True,
+        )
+    except Exception as e:
+        logger.warning(f"Error pushing result to model repo: {e}")
